@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import time
+
+os.environ["XDG_RUNTIME_DIR"] = "/run/user/1000"
+os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+os.environ["QT_QPA_PLATFORM"] = "wayland"
+os.environ["LANG"] = "C.utf8"
+os.environ["LC_ALL"] = "C.utf8"
+
+while True:
+    try:
+        s = subprocess.check_output(
+            ["/usr/bin/kscreen-doctor", "-o"],
+            text=True,
+            stderr=subprocess.STDOUT
+        )
+
+        while chr(27) + "[" in s:
+            start = s.find(chr(27) + "[")
+            end = s.find("m", start)
+            if end == -1:
+                break
+            s = s[:start] + s[end + 1:]
+
+        current_output = None
+        outputs = {}
+
+        for line in s.splitlines():
+            line = line.strip()
+
+            if line.startswith("Output:"):
+                parts = line.split()
+                if len(parts) >= 3:
+                    current_output = parts[2]
+
+            elif "Geometry:" in line and current_output:
+                value = line.split("Geometry:", 1)[1].strip()
+                pos, size = value.split()
+                x, y = map(int, pos.split(","))
+                w, h = map(int, size.split("x"))
+                outputs[current_output] = (x, y, w, h)
+
+        if "DVI-I-1" in outputs and "HDMI-A-1" in outputs:
+            dvi_x, dvi_y, _, _ = outputs["DVI-I-1"]
+            hdmi_x, hdmi_y, hdmi_w, _ = outputs["HDMI-A-1"]
+
+            target_x = hdmi_x + hdmi_w
+            target_y = hdmi_y
+
+            if dvi_x != target_x or dvi_y != target_y:
+                print(
+                    f"Moving DVI-I-1 from {dvi_x},{dvi_y} to {target_x},{target_y}",
+                    flush=True
+                )
+
+                subprocess.run(
+                    [
+                        "/usr/bin/kscreen-doctor",
+                        f"output.1.position.{target_x},{target_y}"
+                    ],
+                    check=False
+                )
+
+    except Exception as e:
+        print(f"Watcher error: {e}", flush=True)
+
+    time.sleep(2)

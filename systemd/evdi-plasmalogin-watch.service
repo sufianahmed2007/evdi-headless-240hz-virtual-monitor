@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep EVDI display to the right of HDMI on Plasma Login Manager
+After=plasmalogin.service
+PartOf=plasmalogin.service
+
+[Service]
+ExecStart=/usr/local/bin/evdi-plasmalogin-watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target

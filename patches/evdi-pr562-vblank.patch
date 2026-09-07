@@ -1,0 +1,300 @@
+diff --git a/module/evdi_drm_drv.h b/module/evdi_drm_drv.h
+index ad6ff9e..25b25b7 100644
+--- a/module/evdi_drm_drv.h
++++ b/module/evdi_drm_drv.h
+@@ -17,6 +17,7 @@
+ #include <linux/version.h>
+ #include <linux/mutex.h>
+ #include <linux/device.h>
++#include <linux/hrtimer.h>
+ #include <linux/i2c.h>
+ #ifdef EVDI_HAVE_DRMP_H
+ #include <drm/drmP.h>
+@@ -47,6 +48,7 @@ struct evdi_painter;
+ struct evdi_device {
+ 	struct drm_device *ddev;
+ 	struct drm_connector *conn;
++	struct drm_crtc *crtc;
+ 	struct evdi_cursor *cursor;
+ 	bool cursor_events_enabled;
+ 
+@@ -57,6 +59,9 @@ struct evdi_device {
+ 	struct evdi_painter *painter;
+ 	struct i2c_adapter *i2c_adapter;
+ 
++	struct hrtimer vblank_timer;
++	ktime_t vblank_period;
++
+ 	int dev_index;
+ };
+ 
+@@ -140,9 +145,6 @@ u8 *evdi_painter_get_edid_copy(struct evdi_device *evdi);
+ int evdi_painter_get_num_dirts(struct evdi_painter *painter);
+ void evdi_painter_mark_dirty(struct evdi_device *evdi,
+ 			     const struct drm_clip_rect *rect);
+-void evdi_painter_set_vblank(struct evdi_painter *painter,
+-			     struct drm_crtc *crtc,
+-			     struct drm_pending_vblank_event *vblank);
+ void evdi_painter_send_update_ready_if_needed(struct evdi_painter *painter);
+ void evdi_painter_dpms_notify(struct evdi_painter *painter, int mode);
+ void evdi_painter_mode_changed_notify(struct evdi_device *evdi,
+diff --git a/module/evdi_modeset.c b/module/evdi_modeset.c
+index 6fe779f..16d1460 100644
+--- a/module/evdi_modeset.c
++++ b/module/evdi_modeset.c
+@@ -51,7 +51,11 @@ static void evdi_crtc_disable(__always_unused struct drm_crtc *crtc)
+ 
+ static void evdi_crtc_destroy(struct drm_crtc *crtc)
+ {
++	struct evdi_device *evdi = crtc->dev->dev_private;
++
+ 	EVDI_CHECKPT();
++	hrtimer_cancel(&evdi->vblank_timer);
++	evdi->crtc = NULL;
+ 	drm_crtc_cleanup(crtc);
+ 	kfree(crtc);
+ }
+@@ -87,16 +91,42 @@ static void evdi_crtc_atomic_flush(
+ 				   (crtc_state->mode_changed || evdi_painter_needs_full_modeset(evdi->painter));
+ 	bool notify_dpms = crtc_state->active_changed || evdi_painter_needs_full_modeset(evdi->painter);
+ 
+-	if (notify_mode_changed)
+-		evdi_painter_mode_changed_notify(evdi, &crtc_state->adjusted_mode);
++	if (notify_mode_changed) {
++		struct drm_display_mode *m = &crtc_state->adjusted_mode;
++
++                if (m->htotal && m->vtotal && m->clock) {
++                        u64 period_ns = (u64)m->vtotal * m->htotal *
++                                        1000000ULL / m->clock;
++
++                        evdi->vblank_period = ktime_set(0, period_ns);
++
++                        EVDI_INFO("vblank: mode=%dx%d clock=%d htotal=%d vtotal=%d period=%llu ns (~%llu Hz)\n",
++                                  m->hdisplay, m->vdisplay, m->clock,
++                                  m->htotal, m->vtotal,
++                                  period_ns,
++                                  1000000000ULL / period_ns);
++                }
++
++evdi_painter_mode_changed_notify(evdi, m);
++	}
+ 
+-	if (notify_dpms)
++	if (notify_dpms) {
++		if (crtc_state->active)
++			drm_crtc_vblank_on(crtc);
+ 		evdi_painter_dpms_notify(evdi->painter,
+ 			crtc_state->active ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
++	}
+ 
+-	evdi_painter_set_vblank(evdi->painter, crtc, crtc_state->event);
++	if (crtc_state->event) {
++		spin_lock(&crtc->dev->event_lock);
++		if (drm_crtc_vblank_get(crtc) != 0)
++			drm_crtc_send_vblank_event(crtc, crtc_state->event);
++		else
++			drm_crtc_arm_vblank_event(crtc, crtc_state->event);
++		spin_unlock(&crtc->dev->event_lock);
++		crtc_state->event = NULL;
++	}
+ 	evdi_painter_send_update_ready_if_needed(evdi->painter);
+-	crtc_state->event = NULL;
+ }
+ 
+ #ifdef EVDI_HAVE_DRM_PRIME_PAGES_TO_SG_DEV
+@@ -192,14 +222,33 @@ static struct drm_crtc_helper_funcs evdi_helper_funcs = {
+ 	.disable        = evdi_crtc_disable
+ };
+ 
+-#ifdef EVDI_HAVE_CRTC_ATOMIC_STATE_ARG
+-static int evdi_enable_vblank(__always_unused struct drm_crtc *crtc)
++#if KERNEL_VERSION(5, 11, 0) <= LINUX_VERSION_CODE || defined(RPI) || defined(EL8)
++static enum hrtimer_restart evdi_vblank_timer_fn(struct hrtimer *timer)
+ {
+-	return 1;
++	struct evdi_device *evdi =
++		container_of(timer, struct evdi_device, vblank_timer);
++
++	if (evdi->crtc)
++		drm_crtc_handle_vblank(evdi->crtc);
++
++	hrtimer_forward_now(timer, evdi->vblank_period);
++	return HRTIMER_RESTART;
+ }
+ 
+-static void evdi_disable_vblank(__always_unused struct drm_crtc *crtc)
++static int evdi_enable_vblank(struct drm_crtc *crtc)
+ {
++	struct evdi_device *evdi = crtc->dev->dev_private;
++
++	hrtimer_start(&evdi->vblank_timer, evdi->vblank_period,
++		      HRTIMER_MODE_REL);
++	return 0;
++}
++
++static void evdi_disable_vblank(struct drm_crtc *crtc)
++{
++	struct evdi_device *evdi = crtc->dev->dev_private;
++
++	hrtimer_cancel(&evdi->vblank_timer);
+ }
+ #endif
+ 
+@@ -216,7 +265,7 @@ static const struct drm_crtc_funcs evdi_crtc_funcs = {
+ 	.cursor_set2            = evdi_crtc_cursor_set,
+ 	.cursor_move            = evdi_crtc_cursor_move,
+ #endif
+-#ifdef EVDI_HAVE_CRTC_ATOMIC_STATE_ARG
++#if KERNEL_VERSION(5, 11, 0) <= LINUX_VERSION_CODE || defined(RPI) || defined(EL8)
+ 	.enable_vblank          = evdi_enable_vblank,
+ 	.disable_vblank         = evdi_disable_vblank,
+ #endif
+@@ -503,6 +552,22 @@ static int evdi_crtc_init(struct drm_device *dev)
+ 	EVDI_DEBUG("drm_crtc_init: %d p%p\n", status, primary_plane);
+ 	drm_crtc_helper_add(crtc, &evdi_helper_funcs);
+ 
++	{
++		struct evdi_device *evdi = dev->dev_private;
++
++		evdi->crtc = crtc;
++		evdi->vblank_period = ktime_set(0, 16666667);
++#if KERNEL_VERSION(6, 12, 0) <= LINUX_VERSION_CODE
++		hrtimer_setup(&evdi->vblank_timer,
++			      evdi_vblank_timer_fn,
++			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++#else
++		hrtimer_init(&evdi->vblank_timer, CLOCK_MONOTONIC,
++			     HRTIMER_MODE_REL);
++		evdi->vblank_timer.function = evdi_vblank_timer_fn;
++#endif
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/module/evdi_painter.c b/module/evdi_painter.c
+index 5cc69ad..c1c0dc5 100644
+--- a/module/evdi_painter.c
++++ b/module/evdi_painter.c
+@@ -110,8 +110,6 @@ struct evdi_painter {
+ 
+ 	bool was_update_requested;
+ 	bool needs_full_modeset;
+-	struct drm_crtc *crtc;
+-	struct drm_pending_vblank_event *vblank;
+ 
+ 	struct list_head pending_events;
+ 	struct delayed_work send_events_work;
+@@ -694,53 +692,6 @@ unlock:
+ 	painter_unlock(painter);
+ }
+ 
+-static void evdi_send_vblank(struct drm_crtc *crtc,
+-			     struct drm_pending_vblank_event *vblank)
+-{
+-	if (crtc && vblank) {
+-		unsigned long flags = 0;
+-
+-		spin_lock_irqsave(&crtc->dev->event_lock, flags);
+-		drm_crtc_send_vblank_event(crtc, vblank);
+-		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+-	}
+-}
+-
+-static void evdi_painter_send_vblank(struct evdi_painter *painter)
+-{
+-	EVDI_CHECKPT();
+-
+-	evdi_send_vblank(painter->crtc, painter->vblank);
+-
+-	painter->crtc = NULL;
+-	painter->vblank = NULL;
+-}
+-
+-void evdi_painter_set_vblank(
+-	struct evdi_painter *painter,
+-	struct drm_crtc *crtc,
+-	struct drm_pending_vblank_event *vblank)
+-{
+-	EVDI_CHECKPT();
+-
+-	if (painter) {
+-		painter_lock(painter);
+-
+-		evdi_painter_send_vblank(painter);
+-
+-		if (painter->num_dirts > 0 && painter->is_connected) {
+-			painter->crtc = crtc;
+-			painter->vblank = vblank;
+-		} else {
+-			evdi_send_vblank(crtc, vblank);
+-		}
+-
+-		painter_unlock(painter);
+-	} else {
+-		evdi_send_vblank(crtc, vblank);
+-	}
+-}
+-
+ void evdi_painter_send_update_ready_if_needed(struct evdi_painter *painter)
+ {
+ 	EVDI_CHECKPT();
+@@ -998,8 +949,6 @@ static int evdi_painter_disconnect(struct evdi_device *evdi,
+ 	EVDI_INFO("(card%d) Disconnected from %s\n", evdi->dev_index, buf);
+ 	evdi_painter_events_cleanup(painter);
+ 
+-	evdi_painter_send_vblank(painter);
+-
+ 	evdi_cursor_enable(evdi->cursor, false);
+ 
+ 	kfree(painter->ddcci_buffer);
+@@ -1069,8 +1018,6 @@ int evdi_painter_grabpix_ioctl(struct drm_device *drm_dev, void *data,
+ 	struct drm_evdi_grabpix *cmd = data;
+ 	struct evdi_framebuffer *efb = NULL;
+ 	struct drm_clip_rect dirty_rects[MAX_DIRTS];
+-	struct drm_crtc *crtc = NULL;
+-	struct drm_pending_vblank_event *vblank = NULL;
+ 	int err;
+ 	int ret;
+ 	struct dma_buf_attachment *import_attach;
+@@ -1125,13 +1072,6 @@ int evdi_painter_grabpix_ioctl(struct drm_device *drm_dev, void *data,
+ 
+ 	drm_framebuffer_get(&efb->base);
+ 
+-	crtc = painter->crtc;
+-	painter->crtc = NULL;
+-
+-	vblank = painter->vblank;
+-	painter->vblank = NULL;
+-
+-
+ 	painter_unlock(painter);
+ 
+ 	if (!efb->obj->vmapping) {
+@@ -1188,8 +1128,6 @@ int evdi_painter_grabpix_ioctl(struct drm_device *drm_dev, void *data,
+ 				       DMA_FROM_DEVICE);
+ 
+ err_fb:
+-	evdi_send_vblank(crtc, vblank);
+-
+ 	drm_framebuffer_put(&efb->base);
+ 
+ 	return err;
+@@ -1332,8 +1270,6 @@ int evdi_painter_init(struct evdi_device *dev)
+ 		dev->painter->edid = NULL;
+ 		dev->painter->edid_length = 0;
+ 		dev->painter->needs_full_modeset = true;
+-		dev->painter->crtc = NULL;
+-		dev->painter->vblank = NULL;
+ 		dev->painter->drm_device = dev->ddev;
+ 		evdi_painter_register_to_vt(dev->painter);
+ #ifdef EVDI_HAVE_DRM_DEBUGFS_ROOT
+@@ -1369,8 +1305,6 @@ void evdi_painter_cleanup(struct evdi_painter *painter)
+ 		drm_framebuffer_put(&painter->scanout_fb->base);
+ 	painter->scanout_fb = NULL;
+ 
+-	evdi_painter_send_vblank(painter);
+-
+ 	evdi_painter_events_cleanup(painter);
+ 
+ 	painter->drm_device = NULL;
