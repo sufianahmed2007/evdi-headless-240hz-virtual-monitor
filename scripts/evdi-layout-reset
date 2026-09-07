@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+STATE_FILE="/var/lib/evdi-headless/layout-state.json"
+
+if [ -f "$STATE_FILE" ]; then
+    rm -f "$STATE_FILE"
+    echo "EVDI layout preference reset."
+    echo "The automatic side-by-side layout will be used again."
+else
+    echo "No saved EVDI layout preference exists."
+fi

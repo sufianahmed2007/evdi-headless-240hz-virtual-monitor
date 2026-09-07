@@ -1,67 +1,106 @@
 #!/usr/bin/env python3
+
+import importlib.util
 import os
 import subprocess
+import sys
 import time
+from pathlib import Path
 
-os.environ["XDG_RUNTIME_DIR"] = "/run/user/1000"
+COMMON = Path("/usr/local/lib/evdi_layout_common.py")
+spec = importlib.util.spec_from_file_location("evdi_layout_common", COMMON)
+if spec is None or spec.loader is None:
+    print(f"Cannot load {COMMON}", file=sys.stderr)
+    sys.exit(1)
+common = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(common)
+
+KSCREEN = "/usr/bin/kscreen-doctor"
+WAYLAND_SOCKET = Path(f"/run/user/{os.getuid()}/wayland-0")
+
+os.environ["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
 os.environ["WAYLAND_DISPLAY"] = "wayland-0"
 os.environ["QT_QPA_PLATFORM"] = "wayland"
 os.environ["LANG"] = "C.utf8"
 os.environ["LC_ALL"] = "C.utf8"
 
+while not WAYLAND_SOCKET.exists():
+    time.sleep(1)
+
+def get_outputs():
+    s = subprocess.check_output(
+        [KSCREEN, "-o"],
+        text=True,
+        stderr=subprocess.STDOUT
+    )
+    return common.parse_kscreen(s)
+
+def discover(outputs):
+    return common.discover_outputs(outputs)
+
+def geometry_map(outputs):
+    return common.geometry_dict(outputs)
+
+def automatic_target(evdi, physical):
+    _, (px, py, pw, _) = physical
+    evdi_name, (_, _, ew, eh) = evdi
+    return evdi_name, (px + pw, py, ew, eh)
+
+state = common.load_state()
+
+if state.get("mode") == "custom":
+    print(f"Custom layout already saved in {common.STATE_FILE}; monitoring disabled.", flush=True)
+    while True:
+        time.sleep(30)
+
+baseline = state.get("baseline")
+
 while True:
     try:
-        s = subprocess.check_output(
-            ["/usr/bin/kscreen-doctor", "-o"],
-            text=True,
-            stderr=subprocess.STDOUT
-        )
+        outputs = get_outputs()
+        current_geometry = geometry_map(outputs)
+        evdi, physical = discover(outputs)
 
-        while chr(27) + "[" in s:
-            start = s.find(chr(27) + "[")
-            end = s.find("m", start)
-            if end == -1:
-                break
-            s = s[:start] + s[end + 1:]
+        if evdi is None or not physical:
+            time.sleep(2)
+            continue
 
-        current_output = None
-        outputs = {}
+        physical.sort(key=lambda item: item[1][0])
+        primary_physical = physical[0]
+        evdi_name, evdi_geometry = evdi
 
-        for line in s.splitlines():
-            line = line.strip()
-
-            if line.startswith("Output:"):
-                parts = line.split()
-                if len(parts) >= 3:
-                    current_output = parts[2]
-
-            elif "Geometry:" in line and current_output:
-                value = line.split("Geometry:", 1)[1].strip()
-                pos, size = value.split()
-                x, y = map(int, pos.split(","))
-                w, h = map(int, size.split("x"))
-                outputs[current_output] = (x, y, w, h)
-
-        if "DVI-I-1" in outputs and "HDMI-A-1" in outputs:
-            dvi_x, dvi_y, _, _ = outputs["DVI-I-1"]
-            hdmi_x, hdmi_y, hdmi_w, _ = outputs["HDMI-A-1"]
-
-            target_x = hdmi_x + hdmi_w
-            target_y = hdmi_y
-
-            if dvi_x != target_x or dvi_y != target_y:
-                print(
-                    f"Moving DVI-I-1 from {dvi_x},{dvi_y} to {target_x},{target_y}",
-                    flush=True
-                )
-
+        if baseline is None:
+            target_name, target_geometry = automatic_target(evdi, primary_physical)
+            if evdi_geometry != target_geometry:
+                x, y, _, _ = evdi_geometry
+                tx, ty, _, _ = target_geometry
+                print(f"Applying default position: {evdi_name} {x},{y} -> {tx},{ty}", flush=True)
                 subprocess.run(
-                    [
-                        "/usr/bin/kscreen-doctor",
-                        f"output.1.position.{target_x},{target_y}"
-                    ],
+                    [KSCREEN, f"output.{evdi_name}.position.{tx},{ty}"],
                     check=False
                 )
+                time.sleep(2)
+                continue
+
+            baseline = current_geometry
+            state = {
+                "mode": "default",
+                "baseline": baseline,
+            }
+            common.save_state(state)
+            print(f"Saved default baseline: {baseline}", flush=True)
+            time.sleep(2)
+            continue
+
+        if current_geometry != baseline:
+            state = {
+                "mode": "custom",
+                "outputs": current_geometry,
+                "baseline": baseline,
+            }
+            common.save_state(state)
+            print(f"Manual/custom layout detected; saved {current_geometry}", flush=True)
+            break
 
     except Exception as e:
         print(f"Watcher error: {e}", flush=True)

@@ -7,6 +7,7 @@ PartOf=plasmalogin.service
 ExecStart=/usr/local/bin/evdi-plasmalogin-watch
 Restart=always
 RestartSec=2
+Environment=EVDI_LAYOUT_STATE=/var/lib/evdi-headless/layout-state.json
 
 [Install]
 WantedBy=graphical.target

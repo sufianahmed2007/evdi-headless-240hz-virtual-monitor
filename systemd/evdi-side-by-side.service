@@ -8,6 +8,7 @@ Restart=always
 RestartSec=2
 Environment=LANG=C.UTF-8
 Environment=LC_ALL=C.UTF-8
+Environment=EVDI_LAYOUT_STATE=/var/lib/evdi-headless/layout-state.json
 
 [Install]
 WantedBy=default.target
